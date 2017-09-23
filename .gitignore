@@ -1,0 +1,7 @@
+*.rds
+*.nb.html
+apik
+.Rproj.user
+.localized
+.DS_Store
+

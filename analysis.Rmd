@@ -1,0 +1,279 @@
+---
+title: "Modelling cyclist count with (linear) multilevel models in Stan"
+author: "Markus Paasiniemi"
+date: "`r Sys.Date()`"
+output: html_document
+bibliography: ref.bib
+---
+
+# Introduction
+
+This report documents a Stan model that uses a hierarchical model to model cyclist count data in Helsinki between 2014 and 2016. The model is fitted via the RStan [@rstan] interface. Note, that this is still a work in prorgess.
+
+
+# Data
+
+The data includes daily average temperature, precipitation amount and number of cyclists passing several different measurement spots. The data can be obtained by running the `get_data.R`-script. 
+
+```{r, message=FALSE, warning=FALSE}
+rm(list = ls())
+library(tidyverse)
+library(gridExtra)
+library(feather)
+library(lubridate)
+library(ggridges)
+library(forcats)
+library(rstan)
+library(bayesplot)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+```
+
+Prepare the data [@fmi, @hri] for the modelling by transforming the cyclist count on log-scale the variables and take a subset of 100 observations for training the model.
+
+```{r}
+set.seed(1)
+df_raw <- read_feather("data/df.feather")
+
+df <- gather(df_raw, station, count, 
+             -(1:4), factor_key = TRUE)
+
+# sample 100 random dates and 
+# select the corresponding observations from each station
+n_tr <- 150
+dates_tr <- sample(df_raw$date, n_tr)
+(df_tr <- filter(df, date %in% dates_tr))
+y <- df_tr$count
+```
+
+Make a few plots to illustrate the possible relationships between the target and the explanatory variables.
+```{r}
+ggplot(df_tr, aes(x = log(count), y = wkday)) +
+  geom_density_ridges(fill = "lightblue", bandwidth = 0.29) +
+  labs(y = "cyclist count", title = "cyclists vs weekday") + theme_classic()
+```
+```{r}
+ggplot(df_tr, aes(x = temp, y = log(count), color = wkday)) +
+  geom_point(size = 0.5, alpha = 0.2) +
+  geom_smooth(method = "lm", se = FALSE) + 
+  labs(y = "cyclist count", title = "cyclists vs temperature") + theme_classic()
+```
+```{r}
+ggplot(df_tr, aes(x = log(count), y = wkday, fill = ifelse(rain == 0, "No rain", "Rain"))) +
+  geom_density_ridges(bandwidth = 0.23, alpha = 0.2) +
+  labs(y = "cyclist count", title = "cyclists vs rain") +
+  theme_classic() +
+  scale_fill_manual(values = c("red", "blue")) +
+  theme(strip.background = element_blank(), legend.title = element_blank())
+```
+
+There seems to be a weekday effect. Also a clear temperature effect which might even vary daily (or be different for weekends and weekdays). There seems to be a difference in cyclist count when it rains and when it does not rain.
+
+# Model
+
+Based on the previous observations, a sensible model might be a linear multilevel model, where effects of rain and temperature vary by weekday. In addition, each station and weekday have separate intercepts. This means
+$$
+\begin{aligned}
+y &\sim N(\mu_y, \sigma_y) \\
+\mu_y &= \alpha^{(0)} + \alpha^{(1)}_{station[n]} + \alpha^{(2)}_{wkday[n]} + \alpha^{(3)}_{wkday[n]}I[x_{rain}>0] + \beta_{wkday[n]}x_{temp},\ & n\in1:N \\
+\alpha^{(0)} &\sim N(\mu_d, 2*\sigma_d) \\
+\alpha^{(1)}_j &\sim N(0, \sigma_{a\_station}),\ & j \in 1:J_{station}\\
+\alpha^{(2)} &\sim N(0, \sigma_{a\_wkday}),\ & j \in 1:J_{wkday} \\
+\alpha^{(3)} &\sim N(\mu_{rain}, \sigma_{a\_rain}),\ & j \in 1:J_{wkday} \\
+\beta &\sim N(\mu_{temp}, \sigma_{b\_temp}),\ & j \in 1:J_{wkday} \\
+\sigma_y, \sigma_{a\_station}, \sigma_{a\_wkday},  &\sim C^+(0, 2.5)\\
+\sigma_{a\_rain}, \sigma_{b\_temp} &~  \sim N(0, 0.5) \\
+\mu_{rain}, \mu_{temp} &\sim N(0, 1),
+
+\end{aligned}
+$$
+where $y$ is the log-count of cyclists, $\alpha^(0)$ is the common intercept, $\alpha^{(1)}_j$ the intercept for each weekday, $\alpha^{(2)}_j$ the intercept for each weekday, $\alpha^{(2)}_j$ the effect of rain for each weekday and $\beta_j$ a coefficient for the effect of temperature for each weekday. The intercept is given a normal prior with mean $\mu_d$ (the mean of the (training) data) and standard deviation $\sigma_d$ (the sd of the data) to help the sampler identify the mean component.
+
+The priors for $\sigma_{a\_rain}$ and $\sigma_{b\_temp}$ are quite tight as it is not likely that the effect of 1 degrees increase in temperature or the effect of rain for any particular weekday is more than 70% increase to the mean effect (although having a (half-)normal prior for a scale parameter could be a problem due to it having so much mass near zero if the data does not separate the effects enough). Also, the corresponding mean parameters have normal priors with scale of one as also the effect of weather (in terms of one degree increase or rain vs no rain) should not be more dramatical than two to three-fold increase in the number of cyclists.
+
+The scale parameters for the other parameters are given very weakly regularizing half-Cauchy priors with a scale of 2.5. Note, that the group means for day-of-the-week effect and station effect are zero centered as they are absorbed to the intercept (although in practice the means are modelled as parameters to improve the efficiency of the sampler as explained in [@arm]).
+
+Let's fit the model.
+```{r, include = FALSE}
+# compile the model
+m_hier <- stan_model("stan/hier.stan")
+```
+
+Depending on the computer, this will take a few minutes.
+```{r, include = FALSE}
+# data for the model
+d <- transmute(df_tr,
+               jj_station = as.integer(df_tr$station),
+               jj_wkday = as.integer(df_tr$wkday),
+               temp, rain, count) %>% as.list() %>%
+  within({
+  N <- length(count)
+  J_station <- unique(jj_station) %>% length()
+  J_wkday <- unique(jj_wkday) %>% length()
+  run_estimation <- 1
+})
+
+# fit the model
+fit <- sampling(m_hier, data = d, seed = 1)
+e <- extract(fit)
+```
+
+Only one divergent transition so likely not a problem. What about some other typical convergence metrics?
+
+```{r}
+grid.arrange(stan_ess(fit, bins = 30),
+             stan_rhat(fit, bins = 30),
+             stan_mcse(fit, bins = 30), ncol = 1)
+```
+Everything seems ok so let's proceed to posterior predictive checks. 
+
+Mean and sd are perfectly fit on the log-scale (no surprise as this is the scale where the (gaussian) model is fit), but there there are some problems with other quantities.
+```{r}
+grid.arrange(
+  ppc_dens_overlay(y, e$count_sim[sample(4000, 50),]) + coord_cartesian(xlim = c(0, 6000)),
+  ppc_stat(y, e$count_sim, stat = "mean", binwidth = 5),
+  ppc_stat(y, e$count_sim, stat = "median", binwidth = 5),
+  ppc_stat(y, e$count_sim, stat = "sd", binwidth = 10), ncol = 1)
+
+```
+
+Seems like in general the model is pretty OK, but not exactly as good as it probably could be. Especially the standard deviation seems to be overestimated quite a lot, which likely related to the transformed scale, but still ideally should not be as severe. Possibly this should be investigated further?
+
+Let's check the model fit also on test data. For comparability the same periods are used as with [GPs](https://github.com/paasim/baana-gp).
+
+```{r}
+posterior_pred <- function(df, lq = 0.05, uq = 0.95) {
+  
+  # transform factor to a matrix of indicators and multiply them by val
+  expand_pred <- function(inds, val) t(model.matrix(~inds - 1) * val)
+  
+  mu <- c(e$a) + 
+          (e$a_station %*% expand_pred(df$station, 1)) +
+          (e$a_wkday %*% expand_pred(df$wkday, 1)) +
+          (e$a_rain %*% expand_pred(df$wkday, df$rain > 0)) +
+          (e$b_temp %*% expand_pred(df$wkday, df$temp))
+  y <- (mu + rnorm(length(mu)) * c(e$sig_y)) %>%
+    exp()
+
+  tibble(date = df$date, 
+         mean = colMeans(y),
+         lq = apply(y, 2, . %>% quantile(., lq)),
+         uq = apply(y, 2, . %>% quantile(., uq)))
+}
+
+cond_s15 <- quo(station == "baana" & date >= "2015-06-19" & date <= "2015-08-23")
+cond_w16 <- quo(station == "baana" & date >= "2015-11-11" & date <= "2016-01-15")
+
+yp_s15 <- posterior_pred(filter(df, eval(cond_s15)))
+yp_w16 <- posterior_pred(filter(df, eval(cond_w16)))
+```
+
+```{r}
+p_s15 <- ggplot(yp_s15, aes(x = date)) +
+  geom_line(aes(y = mean, col = "Posterior mean")) +
+  geom_ribbon(aes(ymin = lq, ymax = uq,
+                  col = "90% posterior predictive interval"), alpha = 0.2) +
+  geom_point(aes(y = count, col = "Test set"), filter(df, eval(cond_s15))) +
+  geom_point(aes(y = count, col = "Training set"), filter(df_tr, eval(cond_s15))) +
+  scale_color_manual(name = "", values = c("Posterior mean" = "black",
+                                           "Training set" = "black",
+                                           "Test set" = "red",
+                                           "90% predictive interval" = "gray")) +
+  labs(y = "count", title = "Cyclist count at Baana in summer 2015") +
+  coord_cartesian(ylim = c(500, 12000)) + guides(color = FALSE) +
+  theme_classic() + theme(legend.position = "bottom")
+p_w16 <- ggplot(yp_w16, aes(x = date)) +
+  geom_line(aes(y = mean, col = "Posterior mean")) +
+  geom_ribbon(aes(ymin = lq, ymax = uq,
+                  col = "90% posterior predictive interval"), alpha = 0.2) +
+  geom_point(aes(y = count, col = "Test set"), filter(df, eval(cond_w16))) +
+  geom_point(aes(y = count, col = "Training set"), filter(df_tr, eval(cond_w16))) +
+  scale_color_manual(name = "", values = c("Posterior mean" = "black",
+                                           "Training set" = "black",
+                                           "Test set" = "red",
+                                           "90% predictive interval" = "gray")) +
+  theme_classic() + theme(legend.position = "bottom") +
+  labs(y = "count", title = "Cyclist count at Baana in winter 2015/2016") +
+  guides(color = guide_legend(override.aes=list(
+    shape=c(NA, NA, 16, 16), linetype = c(1, 1, 0, 0),
+    fill = c("gray", rep("white", 3)))))
+
+grid.arrange(p_s15, p_w16)
+```
+Seems like the model fits to the data quite well and it seems to be able to identify the relevant patterns in the data. On the other hand, the variance seems quite high during the summer suggesting that there is likely some room for improvement.
+
+A numerical check for the calibration of the model, shows that the predictions are calibrated quite OK
+```{r}
+df_test <- filter(df, !(date %in% df_tr$date))
+yp_test9 <- posterior_pred(df_test)
+
+map2(c(0.25, 0.125, 0.05), c(0.75, 0.875, 0.95), 
+          ~posterior_pred(df_test, .x, .y)) %>%
+  set_names(c("50%", "75%", "90%")) %>%
+  map_dbl(~mean(.x$lq <= df_test$count & .x$uq >= df_test$count))
+```
+
+
+# Results
+
+Because the modelling is done on log-scale, all the effects are multiplicative.
+
+Differences between the stations:
+```{r}
+(as_tibble(e$a_station) + e$a + e$mu_b_temp*16) %>%
+  set_names(levels(df_tr$station)) %>%
+  gather(station, log_count, factor_key = TRUE) %>%
+  ggplot(aes(x = exp(log_count), y = station)) +
+  geom_density_ridges(fill = "lightblue", bandwidth = 125) +
+  coord_cartesian(xlim = c(0, 10000)) +
+  labs(x = "count",
+       title = "Cyclist count by station, no rain and daily avg temp is 16 deg")
+```
+There is much more variation on some stations than others. The ones having the most variation also seem to be the most popular routes. Maybe this is related to some construction work? This might also be related to the problems seen in the posterior predictive checks.
+
+Difference between weekdays:
+```{r}
+as_tibble(e$a_wkday) %>%
+  set_names(levels(df_tr$wkday)) %>%
+  gather(wkday, log_count, factor_key = TRUE) %>%
+  ggplot(aes(x = exp(log_count), y = wkday)) +
+  geom_density_ridges(fill = "lightblue", bandwidth = 0.04) +
+  coord_cartesian(xlim = c(0, 2.5)) +
+  labs(x = "multiplicative effect", y = "day of the week",
+       title = "Day-of-the-week effect on cyclist count")
+```
+Monday to Thursday seem to amount to ~50% increase increase in the number of cyclists (compared to the average number of cyclists). On fridays there is roughly no effect. Sundays and Saturdays to amount to 50% decrease, so for example Sunday to Monday is around 2-fold increase.
+
+Temperature effect:
+```{r}
+as_tibble(cbind(e$mu_b_temp, e$b_temp)) %>%
+  set_names(c("Group mean", levels(df_tr$wkday))) %>%
+  gather(wkday, log_count, factor_key = TRUE) %>%
+  ggplot(aes(x = exp(log_count), y = wkday, fill = (wkday == "Group mean"))) +
+  geom_density_ridges(bandwidth = 0.002) +
+  scale_fill_manual(values = c("lightblue", "lightblue1")) +
+  guides(fill = FALSE) +
+  coord_cartesian(xlim = c(1.05, 1.13)) +
+  labs(x = "multiplicative effect of 1 deg increase", y = "day of the week",
+       title = "Effect of temperature on cyclist count")
+```
+Increase of 1 degree seems to amount to around 8% increase in the number of cyclists, which is a notable effect. Also, the effect is stronger on weekend which seems sensible. Why the effect is also high on Thursdays is not very clear. Also, as observed with [GPs](https://github.com/paasim/baana-gp), the effect might be somewhat non-linear.
+
+Effect of rain:
+```{r}
+as_tibble(cbind(e$mu_a_rain, e$a_rain)) %>%
+  set_names(c("Group mean", levels(df_tr$wkday))) %>%
+  gather(wkday, log_count, factor_key = TRUE) %>%
+  ggplot(aes(x = exp(log_count), y = wkday, fill = (wkday == "Group mean"))) +
+  geom_density_ridges(bandwidth = 0.02) +
+  scale_fill_manual(values = c("lightblue", "lightblue1")) +
+  guides(fill = FALSE) +
+  labs(x = "multiplicative effect of rain", y = "day of the week",
+       title = "Effect of rain on cyclist count")
+```
+Rain does appear to have a notable effect, on average ~20% decrease in the number of cyclists. Furthermore, the effect seems to be extremely strong on Sundays, when rain seems to drop the number of cyclists by 50%. This might make sense as on Sundays people might go out to cycle especially if the weather is good. On the other hand, it would make sense for this to appear on Saturdays as well.
+
+# Conclusion
+This is still not complete, but seems like fitting multilevel models in Stan is relatively easy and useful.
+
+# References
